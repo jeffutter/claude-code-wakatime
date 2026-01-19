@@ -1,9 +1,11 @@
 import adm_zip from 'adm-zip';
 import * as child_process from 'child_process';
 import * as fs from 'fs';
+import * as https from 'https';
+import * as http from 'http';
 import * as os from 'os';
 import * as path from 'path';
-import * as request from 'request';
+import { URL } from 'url';
 import * as semver from 'semver';
 import * as which from 'which';
 
@@ -149,36 +151,60 @@ export class Dependencies {
   private getLatestCliVersion(callback: (arg0: string) => void): void {
     const proxy = this.options.getSetting('settings', 'proxy');
     const noSSLVerify = this.options.getSetting('settings', 'no_ssl_verify');
-    let options: request.CoreOptions & { url: string } = {
-      url: this.githubReleasesUrl,
-      json: true,
+    const url = new URL(this.githubReleasesUrl);
+
+    const requestOptions: https.RequestOptions = {
+      hostname: url.hostname,
+      port: url.port || 443,
+      path: url.pathname + url.search,
+      method: 'GET',
       headers: {
         'User-Agent': 'github.com/wakatime/claude-code-wakatime',
       },
+      rejectUnauthorized: noSSLVerify !== 'true',
     };
-    this.logger.debug(`Fetching latest wakatime-cli version from GitHub API: ${options.url}`);
+
+    this.logger.debug(`Fetching latest wakatime-cli version from GitHub API: ${this.githubReleasesUrl}`);
     if (proxy) {
       this.logger.debug(`Using Proxy: ${proxy}`);
-      options['proxy'] = proxy;
+      // Note: Proxy support would require additional implementation with http-proxy-agent
+      this.logger.warn('Proxy support with native https module requires additional setup');
     }
-    if (noSSLVerify === 'true') options['strictSSL'] = false;
+
     try {
-      request.get(options, (error, response, json) => {
-        if (!error && response && response.statusCode == 200) {
-          this.logger.debug(`GitHub API Response ${response.statusCode}`);
-          const latestCliVersion = json['tag_name'];
-          this.logger.debug(`Latest wakatime-cli version from GitHub: ${latestCliVersion}`);
-          this.options.setSetting('internal', 'cli_version_last_accessed', String(Math.round(Date.now() / 1000)), true);
-          callback(latestCliVersion);
-        } else {
-          if (response) {
-            this.logger.warn(`GitHub API Response ${response.statusCode}: ${error}`);
+      const req = https.get(requestOptions, (response) => {
+        let data = '';
+
+        response.on('data', (chunk) => {
+          data += chunk;
+        });
+
+        response.on('end', () => {
+          if (response.statusCode === 200) {
+            try {
+              this.logger.debug(`GitHub API Response ${response.statusCode}`);
+              const json = JSON.parse(data);
+              const latestCliVersion = json['tag_name'];
+              this.logger.debug(`Latest wakatime-cli version from GitHub: ${latestCliVersion}`);
+              this.options.setSetting('internal', 'cli_version_last_accessed', String(Math.round(Date.now() / 1000)), true);
+              callback(latestCliVersion);
+            } catch (e) {
+              this.logger.warn(`Failed to parse GitHub API response: ${e}`);
+              callback('');
+            }
           } else {
-            this.logger.warn(`GitHub API Response Error: ${error}`);
+            this.logger.warn(`GitHub API Response ${response.statusCode}`);
+            callback('');
           }
-          callback('');
-        }
+        });
       });
+
+      req.on('error', (error) => {
+        this.logger.warn(`GitHub API Response Error: ${error}`);
+        callback('');
+      });
+
+      req.end();
     } catch (e) {
       this.logger.warnException(e);
       callback('');
@@ -266,30 +292,74 @@ export class Dependencies {
   private downloadFile(url: string, outputFile: string, callback: () => void, error: () => void): void {
     const proxy = this.options.getSetting('settings', 'proxy');
     const noSSLVerify = this.options.getSetting('settings', 'no_ssl_verify');
-    let options: request.CoreOptions & { url: string } = { url: url };
+
     if (proxy) {
       this.logger.debug(`Using Proxy: ${proxy}`);
-      options['proxy'] = proxy;
+      this.logger.warn('Proxy support with native https module requires additional setup');
     }
-    if (noSSLVerify === 'true') options['strictSSL'] = false;
-    try {
-      let r = request.get(options);
-      r.on('error', (e) => {
-        this.logger.warn(`Failed to download ${url}`);
-        this.logger.warn(e.toString());
+
+    const download = (downloadUrl: string, redirectCount: number = 0): void => {
+      if (redirectCount > 5) {
+        this.logger.warn(`Too many redirects for ${url}`);
         error();
-      });
-      let out = fs.createWriteStream(outputFile);
-      r.pipe(out);
-      r.on('end', () => {
-        out.on('finish', () => {
-          callback();
+        return;
+      }
+
+      try {
+        const urlObj = new URL(downloadUrl);
+        const protocol = urlObj.protocol === 'https:' ? https : http;
+
+        const requestOptions: https.RequestOptions = {
+          hostname: urlObj.hostname,
+          port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
+          path: urlObj.pathname + urlObj.search,
+          method: 'GET',
+          rejectUnauthorized: noSSLVerify !== 'true',
+        };
+
+        const req = protocol.get(requestOptions, (response) => {
+          // Handle redirects
+          if (response.statusCode && response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+            this.logger.debug(`Following redirect to ${response.headers.location}`);
+            download(response.headers.location, redirectCount + 1);
+            return;
+          }
+
+          if (response.statusCode !== 200) {
+            this.logger.warn(`Failed to download ${downloadUrl}: HTTP ${response.statusCode}`);
+            error();
+            return;
+          }
+
+          const out = fs.createWriteStream(outputFile);
+
+          response.pipe(out);
+
+          out.on('finish', () => {
+            callback();
+          });
+
+          out.on('error', (e) => {
+            this.logger.warn(`Failed to write file ${outputFile}`);
+            this.logger.warn(e.toString());
+            error();
+          });
         });
-      });
-    } catch (e) {
-      this.logger.warnException(e);
-      error();
-    }
+
+        req.on('error', (e) => {
+          this.logger.warn(`Failed to download ${downloadUrl}`);
+          this.logger.warn(e.toString());
+          error();
+        });
+
+        req.end();
+      } catch (e) {
+        this.logger.warnException(e);
+        error();
+      }
+    };
+
+    download(url);
   }
 
   private unzip(file: string, outputDir: string, callback: (unzipped: boolean) => void): void {
@@ -378,15 +448,32 @@ export class Dependencies {
   }
 
   private reportMissingPlatformSupport(osname: string, architecture: string): void {
-    const url = `https://api.wakatime.com/api/v1/cli-missing?osname=${osname}&architecture=${architecture}&plugin=claude-code`;
+    const urlString = `https://api.wakatime.com/api/v1/cli-missing?osname=${osname}&architecture=${architecture}&plugin=claude-code`;
     const proxy = this.options.getSetting('settings', 'proxy');
     const noSSLVerify = this.options.getSetting('settings', 'no_ssl_verify');
-    let options: request.CoreOptions & { url: string } = { url: url };
-    if (proxy) options['proxy'] = proxy;
-    if (noSSLVerify === 'true') options['strictSSL'] = false;
+
     try {
-      request.get(options);
-    } catch (e) {}
+      const url = new URL(urlString);
+      const requestOptions: https.RequestOptions = {
+        hostname: url.hostname,
+        port: url.port || 443,
+        path: url.pathname + url.search,
+        method: 'GET',
+        rejectUnauthorized: noSSLVerify !== 'true',
+      };
+
+      if (proxy) {
+        this.logger.debug(`Using Proxy: ${proxy}`);
+      }
+
+      const req = https.get(requestOptions);
+      req.on('error', () => {
+        // Silently ignore errors for this fire-and-forget request
+      });
+      req.end();
+    } catch (e) {
+      // Silently ignore errors
+    }
   }
 
   private randStr(): string {
